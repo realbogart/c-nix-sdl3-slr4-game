@@ -1,0 +1,5 @@
+/noctis
+/build/
+/result
+*.o
+*.ppm
