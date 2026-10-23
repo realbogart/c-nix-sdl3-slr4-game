@@ -90,6 +90,10 @@
           } ''
             mkdir -p $out
             tar -xJf $src -C $out --no-same-owner --no-same-permissions --strip-components=1
+            # The game is 64-bit only: set up just the primary architecture
+            # (the i386 half would need a 32-bit loader on the host).
+            sed -i 's/^\(export PRESSURE_VESSEL_ARCHITECTURES=[^:]*\):.*/\1/' $out/run
+            grep -q '^export PRESSURE_VESSEL_ARCHITECTURES=${rt.triplet}$' $out/run
           '';
 
           # pressure-vessel expects an FHS host (/usr/bin, /etc/ld.so.cache,
@@ -99,13 +103,19 @@
           run = pkgs.buildFHSEnv {
             name = "steamrt4-run";
             targetPkgs = p: with p; [
-              bash coreutils
+              bash coreutils getent
               libdrm libGL libglvnd mesa vulkan-loader
               wayland libxkbcommon
               libX11 libXcursor libXext libXfixes libXi libXrandr libXScrnSaver libxcb
               pipewire libpulseaudio alsa-lib
               dbus udev
             ];
+            # The FHS env's /usr/bin/ldconfig is a shell wrapper. pressure-vessel
+            # then looks for the real ELF next to it as ldconfig.real (the
+            # Debian/Ubuntu convention) to learn its architecture.
+            extraBuildCommands = ''
+              ln -s ${pkgs.glibc.bin}/bin/ldconfig $out/usr/bin/ldconfig.real
+            '';
             # pressure-vessel takes locks inside the runtime directory, so it
             # cannot run from the read-only store: copy it once to the cache.
             runScript = pkgs.writeShellScript "steamrt4-run" ''
