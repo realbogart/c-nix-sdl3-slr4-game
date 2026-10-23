@@ -44,7 +44,7 @@ int irand(int lo, int hi);          /* [lo,hi] */
 float wrap_angle(float a);          /* (-PI, PI] */
 
 /* ------------------------------------------------------------------ */
-/* platform: raw X11 protocol (x11.c)                                  */
+/* platform: SDL3 window, input and timing (sdl.c)                    */
 /* ------------------------------------------------------------------ */
 enum {
     K_NONE,
@@ -80,7 +80,7 @@ double plat_time(void);
 void plat_sleep(double seconds);
 
 /* ------------------------------------------------------------------ */
-/* audio: PulseAudio native protocol + software mixer (audio.c)        */
+/* audio: software mixer feeding an SDL3 audio stream (audio.c)       */
 /* ------------------------------------------------------------------ */
 enum {
     SND_DAGGER, SND_DAGGER_HIT, SND_CROSSBOW, SND_BLUNDER, SND_DRYFIRE,

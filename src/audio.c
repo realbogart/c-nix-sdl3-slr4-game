@@ -1,190 +1,21 @@
 /*
- * Audio: speaks the PulseAudio native protocol directly (works with
- * PulseAudio and pipewire-pulse), mixes positional sound effects, runs a
- * small organ/bell music sequencer and a Schroeder reverb for a cathedral
- * acoustic. If no server is reachable the game simply runs silent.
+ * Audio: mixes positional sound effects, runs a small organ/bell music
+ * sequencer and a Schroeder reverb for a cathedral acoustic, and feeds the
+ * result to an SDL3 audio stream. If no audio device can be opened the game
+ * simply runs silent.
  */
 #include "common.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include <SDL3/SDL.h>
 
-#define PA_VERSION 13
-#define CMD_ERROR 0
-#define CMD_REPLY 2
-#define CMD_CREATE_PLAYBACK_STREAM 3
-#define CMD_AUTH 8
-#define CMD_SET_CLIENT_NAME 9
-#define CMD_REQUEST 61
-#define CTRL_CHANNEL 0xffffffffu
+/* keep about this much audio queued ahead of the device */
+#define QUEUE_MS 50
 
-static int s_fd = -1;
+static SDL_AudioStream *s_stream;
 static bool s_ok;
-static u32 s_channel;
-static u32 s_requested;
-static u8 s_rbuf[1 << 16];
-static int s_rlen;
-static u8 s_wbuf[1 << 17];
-static int s_wlen;
 
 static Sample s_snd[SND_COUNT];
 static float s_lx, s_ly, s_lang;
-
-/* ------------------------------------------------------------------ */
-/* tagstruct                                                           */
-/* ------------------------------------------------------------------ */
-typedef struct { u8 d[2048]; int n; } TS;
-
-static void ts_raw(TS *t, const void *p, int n) { if (t->n + n <= (int)sizeof t->d) { memcpy(t->d + t->n, p, (size_t)n); t->n += n; } }
-static void ts_byte(TS *t, u8 b) { ts_raw(t, &b, 1); }
-static void be32(u8 *p, u32 v) { p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v; }
-static u32 rbe32(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
-static void ts_u32(TS *t, u32 v) { u8 b[5] = {'L'}; be32(b + 1, v); ts_raw(t, b, 5); }
-static void ts_bool(TS *t, bool v) { ts_byte(t, v ? '1' : '0'); }
-static void ts_str(TS *t, const char *s) { ts_byte(t, 't'); ts_raw(t, s, (int)strlen(s) + 1); }
-static void ts_null(TS *t) { ts_byte(t, 'N'); }
-static void ts_arb(TS *t, const void *p, u32 n) { u8 b[5] = {'x'}; be32(b + 1, n); ts_raw(t, b, 5); ts_raw(t, p, (int)n); }
-
-static void ts_props(TS *t, const char *k, const char *v)
-{
-    ts_byte(t, 'P');
-    ts_str(t, k);
-    ts_u32(t, (u32)strlen(v) + 1);
-    ts_arb(t, v, (u32)strlen(v) + 1);
-    ts_null(t);
-}
-
-static bool send_all(const void *p, int n)
-{
-    const u8 *b = p;
-    while (n > 0) {
-        ssize_t w = write(s_fd, b, (size_t)n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN) { struct pollfd pf = {s_fd, POLLOUT, 0}; poll(&pf, 1, 100); continue; }
-            return false;
-        }
-        b += w;
-        n -= (int)w;
-    }
-    return true;
-}
-
-static bool send_cmd(const TS *t)
-{
-    u8 hdr[20] = {0};
-    be32(hdr, (u32)t->n);
-    be32(hdr + 4, CTRL_CHANNEL);
-    return send_all(hdr, 20) && send_all(t->d, t->n);
-}
-
-/* wait for the reply to `tag`; returns pointer to the payload after cmd/tag */
-static const u8 *wait_reply(u32 tag, int *len)
-{
-    static u8 pkt[1 << 16];
-    for (int tries = 0; tries < 200; tries++) {
-        while (s_rlen >= 20) {
-            u32 plen = rbe32(s_rbuf), chan = rbe32(s_rbuf + 4);
-            if (plen > sizeof pkt) return NULL;
-            if (s_rlen < 20 + (int)plen) break;
-            memcpy(pkt, s_rbuf + 20, plen);
-            memmove(s_rbuf, s_rbuf + 20 + plen, (size_t)(s_rlen - 20 - (int)plen));
-            s_rlen -= 20 + (int)plen;
-            if (chan != CTRL_CHANNEL || plen < 10) continue;
-            u32 cmd = rbe32(pkt + 1), t = rbe32(pkt + 6);
-            if (t != tag) {
-                if (cmd == CMD_REQUEST && plen >= 20) s_requested += rbe32(pkt + 16);
-                continue;
-            }
-            if (cmd != CMD_REPLY) return NULL;
-            *len = (int)plen - 10;
-            return pkt + 10;
-        }
-        struct pollfd pf = {s_fd, POLLIN, 0};
-        if (poll(&pf, 1, 10) <= 0) continue;
-        ssize_t n = read(s_fd, s_rbuf + s_rlen, sizeof s_rbuf - (size_t)s_rlen);
-        if (n <= 0) return NULL;
-        s_rlen += (int)n;
-    }
-    return NULL;
-}
-
-static bool pa_connect(void)
-{
-    char path[256];
-    const char *srv = getenv("PULSE_SERVER");
-    if (srv && !strncmp(srv, "unix:", 5)) snprintf(path, sizeof path, "%s", srv + 5);
-    else if (srv && srv[0] == '/') snprintf(path, sizeof path, "%s", srv);
-    else {
-        const char *rt = getenv("XDG_RUNTIME_DIR");
-        if (!rt) return false;
-        snprintf(path, sizeof path, "%s/pulse/native", rt);
-    }
-    s_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s_fd < 0) return false;
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof sa.sun_path) { close(s_fd); s_fd = -1; return false; }
-    memcpy(sa.sun_path, path, strlen(path) + 1);
-    if (connect(s_fd, (struct sockaddr *)&sa, sizeof sa) < 0) { close(s_fd); s_fd = -1; return false; }
-
-    u8 cookie[256] = {0};
-    char cpath[512];
-    const char *home = getenv("HOME");
-    if (home) {
-        snprintf(cpath, sizeof cpath, "%s/.config/pulse/cookie", home);
-        FILE *f = fopen(cpath, "rb");
-        if (f) { if (fread(cookie, 1, sizeof cookie, f) != sizeof cookie) memset(cookie, 0, sizeof cookie); fclose(f); }
-    }
-    int len;
-    TS t = {0};
-    ts_u32(&t, CMD_AUTH); ts_u32(&t, 0);
-    ts_u32(&t, PA_VERSION);
-    ts_arb(&t, cookie, sizeof cookie);
-    if (!send_cmd(&t) || !wait_reply(0, &len)) return false;
-
-    t.n = 0;
-    ts_u32(&t, CMD_SET_CLIENT_NAME); ts_u32(&t, 1);
-    ts_props(&t, "application.name", "Noctis");
-    if (!send_cmd(&t) || !wait_reply(1, &len)) return false;
-
-    const u32 bytes_per_sec = AUDIO_RATE * 4;
-    t.n = 0;
-    ts_u32(&t, CMD_CREATE_PLAYBACK_STREAM); ts_u32(&t, 2);
-    u8 ss[7] = {'a', 3 /* S16LE */, 2, 0, 0, 0, 0};
-    be32(ss + 3, AUDIO_RATE);
-    ts_raw(&t, ss, 7);
-    u8 cm[4] = {'m', 2, 1, 2};
-    ts_raw(&t, cm, 4);
-    ts_u32(&t, 0xffffffffu);   /* sink index */
-    ts_null(&t);                /* sink name */
-    ts_u32(&t, 0xffffffffu);   /* maxlength */
-    ts_bool(&t, false);         /* corked */
-    ts_u32(&t, bytes_per_sec * 50 / 1000);  /* tlength: 50ms */
-    ts_u32(&t, 0xffffffffu);   /* prebuf */
-    ts_u32(&t, bytes_per_sec * 10 / 1000);  /* minreq */
-    ts_u32(&t, 0);              /* sync id */
-    u8 vol[10] = {'v', 2};
-    be32(vol + 2, 0x10000);
-    be32(vol + 6, 0x10000);
-    ts_raw(&t, vol, 10);
-    for (int i = 0; i < 7; i++) ts_bool(&t, false); /* v12 flags */
-    ts_bool(&t, false);         /* muted */
-    ts_bool(&t, true);          /* adjust latency */
-    ts_props(&t, "media.name", "Noctis");
-    if (!send_cmd(&t)) return false;
-    const u8 *r = wait_reply(2, &len);
-    if (!r || len < 15 || r[0] != 'L' || r[5] != 'L' || r[10] != 'L') return false;
-    s_channel = rbe32(r + 1);
-    s_requested += rbe32(r + 11);
-    fcntl(s_fd, F_SETFL, fcntl(s_fd, F_GETFL) | O_NONBLOCK);
-    return true;
-}
 
 /* ------------------------------------------------------------------ */
 /* mixer                                                               */
@@ -439,67 +270,22 @@ static void mix(i16 *out, int frames)
 /* ------------------------------------------------------------------ */
 /* pump                                                                */
 /* ------------------------------------------------------------------ */
-static void handle_incoming(void)
-{
-    for (;;) {
-        ssize_t n = read(s_fd, s_rbuf + s_rlen, sizeof s_rbuf - (size_t)s_rlen);
-        if (n > 0) { s_rlen += (int)n; continue; }
-        if (n == 0) { s_ok = false; return; }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        if (errno == EINTR) continue;
-        s_ok = false;
-        return;
-    }
-    while (s_rlen >= 20) {
-        u32 plen = rbe32(s_rbuf), chan = rbe32(s_rbuf + 4);
-        if (plen > sizeof s_rbuf - 20) { s_ok = false; return; }
-        if (s_rlen < 20 + (int)plen) break;
-        const u8 *p = s_rbuf + 20;
-        if (chan == CTRL_CHANNEL && plen >= 10) {
-            u32 cmd = rbe32(p + 1);
-            if (cmd == CMD_REQUEST && plen >= 20 && rbe32(p + 11) == s_channel) s_requested += rbe32(p + 16);
-            else if (cmd == CMD_ERROR) { fprintf(stderr, "audio: server error\n"); s_ok = false; }
-        }
-        memmove(s_rbuf, s_rbuf + 20 + plen, (size_t)(s_rlen - 20 - (int)plen));
-        s_rlen -= 20 + (int)plen;
-    }
-}
-
-static void flush_out(void)
-{
-    while (s_wlen > 0) {
-        ssize_t w = write(s_fd, s_wbuf, (size_t)s_wlen);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) s_ok = false;
-            return;
-        }
-        memmove(s_wbuf, s_wbuf + w, (size_t)(s_wlen - w));
-        s_wlen -= (int)w;
-    }
-}
-
 void audio_update(void)
 {
     if (!s_ok) return;
     s_music_target = s_music_on ? 1.0f : 0.0f;
-    handle_incoming();
-    flush_out();
     static i16 tmp[4096];
-    while (s_ok && s_requested >= 4) {
-        u32 n = s_requested > sizeof tmp ? (u32)sizeof tmp : s_requested;
-        n &= ~3u;
-        if (s_wlen + 20 + (int)n > (int)sizeof s_wbuf) break;
-        mix(tmp, (int)(n / 4));
-        u8 *h = s_wbuf + s_wlen;
-        memset(h, 0, 20);
-        be32(h, n);
-        be32(h + 4, s_channel);
-        memcpy(h + 20, tmp, n);
-        s_wlen += 20 + (int)n;
-        s_requested -= n;
+    const int frame_bytes = 4, target = AUDIO_RATE * frame_bytes * QUEUE_MS / 1000;
+    int queued = SDL_GetAudioStreamQueued(s_stream);
+    if (queued < 0) return;
+    while (queued < target) {
+        int frames = (target - queued) / frame_bytes;
+        if (frames > (int)(sizeof tmp / frame_bytes)) frames = (int)(sizeof tmp / frame_bytes);
+        if (frames < 1) break;
+        mix(tmp, frames);
+        if (!SDL_PutAudioStreamData(s_stream, tmp, frames * frame_bytes)) break;
+        queued += frames * frame_bytes;
     }
-    flush_out();
 }
 
 bool audio_init(void)
@@ -511,21 +297,22 @@ bool audio_init(void)
                       0.12f * sinf(6 * ph) + 0.1f * sinf(8 * ph)) / 2.3f;
     }
     if (getenv("NOCTIS_NO_AUDIO")) return false;
-    if (!pa_connect()) {
-        if (s_fd >= 0) close(s_fd);
-        s_fd = -1;
-        fprintf(stderr, "audio: no PulseAudio server, running silent\n");
+    const SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, AUDIO_RATE};
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO) ||
+        !(s_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL))) {
+        fprintf(stderr, "audio: %s, running silent\n", SDL_GetError());
         return false;
     }
     reverb_init();
     sfx_generate(s_snd);
+    SDL_ResumeAudioStreamDevice(s_stream);
     s_ok = true;
     return true;
 }
 
 void audio_shutdown(void)
 {
-    if (s_fd >= 0) close(s_fd);
-    s_fd = -1;
+    if (s_stream) SDL_DestroyAudioStream(s_stream);
+    s_stream = NULL;
     s_ok = false;
 }

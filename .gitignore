@@ -1,5 +1,5 @@
 /noctis
 /build/
-/result
 *.o
 *.ppm
+/result*

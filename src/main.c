@@ -346,7 +346,7 @@ int main(int argc, char **argv)
     if (shot) return run_shot(shot, level, frames, have_pos ? pos : NULL, weapon, title, map, fire);
 
     if (!plat_init("NOCTIS", win_w, win_h)) {
-        fprintf(stderr, "noctis: could not open an X11 window (is DISPLAY set?)\n");
+        fprintf(stderr, "noctis: could not open a window\n");
         return 1;
     }
     audio_init();
